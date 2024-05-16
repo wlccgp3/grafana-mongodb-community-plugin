@@ -35,3 +35,4 @@ e2e-results/
 integration-test/vendor
 integration-test/images
 integration-test/groups
+package-lock.json
