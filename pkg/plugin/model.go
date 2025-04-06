@@ -2,11 +2,14 @@ package plugin
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
 
 	sprig "github.com/go-task/slim-sprig"
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/bson"
@@ -339,8 +342,69 @@ func (m *QueryModel) getTimeBoundPipelineStage(from time.Time, to time.Time) (bs
 	}}, nil
 }
 
+// Helper function to convert time to MongoDB ObjectId format
+func timeToObjectId(t time.Time) string {
+	timestamp := t.Unix()
+	objectId := bsonPrim.NewObjectIDFromTimestamp(time.Unix(timestamp, 0))
+	return objectId.Hex()
+}
+
+// replaceCustomFunctions replaces the custom time variables in the aggregation pipeline
+func replaceCustomFunctions(aggregation string, timeRange backend.TimeRange) string {
+	log.DefaultLogger.Debug("Original aggregation:", "aggregation", aggregation)
+
+	fromTime := timeRange.From
+	toTime := timeRange.To
+
+	// Define regex to match custom time variables
+	customFuncRegex := regexp.MustCompile(`\$\{\s*__(from|to):date(?::([^\s\}]+))?\s*\}`)
+
+	// Replace custom time variables
+	replacedAggregation := customFuncRegex.ReplaceAllStringFunc(aggregation, func(match string) string {
+		parts := customFuncRegex.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match // Shouldn't happen
+		}
+		datePart := parts[1]
+		formatPart := parts[2]
+		var timeValue time.Time
+		if datePart == "from" {
+			timeValue = fromTime
+		} else {
+			timeValue = toTime
+		}
+
+		if formatPart == "" || formatPart == "iso" {
+			return timeValue.Format(time.RFC3339)
+		}
+		switch formatPart {
+		case "toObjectId":
+			return timeToObjectId(timeValue)
+		case "seconds":
+			return fmt.Sprintf("%d", timeValue.Unix())
+		case "milliseconds":
+			return fmt.Sprintf("%d", timeValue.UnixNano()/1e6)
+		default:
+			// Handle custom date format
+			return timeValue.Format(formatPart)
+		}
+	})
+
+	log.DefaultLogger.Debug("Replaced aggregation:", "aggregation", replacedAggregation)
+	return replacedAggregation
+}
+
 func (m *QueryModel) getPipeline(from time.Time, to time.Time) (mongo.Pipeline, error) {
 	pipeline := mongo.Pipeline{}
+
+	// Prepare time range
+	timeRange := backend.TimeRange{
+		From: from,
+		To:   to,
+	}
+
+	// Replace custom functions in aggregation
+	aggregation := replaceCustomFunctions(m.Aggregation, timeRange)
 
 	if m.QueryType == queryTypeTimeseries && m.AutoTimeBound && m.AutoTimeBoundAtStart {
 		timeBoundStage, err := m.getTimeBoundPipelineStage(from, to)
@@ -351,7 +415,7 @@ func (m *QueryModel) getPipeline(from time.Time, to time.Time) (mongo.Pipeline, 
 	}
 
 	userPipeline := mongo.Pipeline{}
-	err := bson.UnmarshalExtJSON([]byte(m.Aggregation), false, &userPipeline)
+	err := bson.UnmarshalExtJSON([]byte(aggregation), false, &userPipeline)
 	if err != nil {
 		return mongo.Pipeline{}, errors.Wrap(err, "Failed to parse aggregation pipeline")
 	}
@@ -366,9 +430,9 @@ func (m *QueryModel) getPipeline(from time.Time, to time.Time) (mongo.Pipeline, 
 	}
 	if m.QueryType == queryTypeTimeseries && m.AutoTimeSort {
 		pipeline = append(pipeline, bson.D{
-			bson.E{
+			{
 				Key:   "$sort",
-				Value: bson.D{bson.E{Key: m.TimestampField, Value: 1}},
+				Value: bson.D{{Key: m.TimestampField, Value: 1}},
 			},
 		})
 	}
